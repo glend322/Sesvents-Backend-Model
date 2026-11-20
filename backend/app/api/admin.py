@@ -17,10 +17,12 @@ Staff management (ADR-047, ADR-048): POST/GET /api/admin/staff, additionally gua
 """
 from __future__ import annotations
 
+import os
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Generic, Literal, TypeVar
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Query, Request
 from psycopg.errors import UniqueViolation
@@ -498,4 +500,136 @@ async def list_staff(
         )
     return Page[StaffOut](
         items=[StaffOut(**vars(r)) for r in rows], page=q.page, page_size=q.page_size, total=total
+    )
+
+
+# ---- student demo account usage tracking (ADR-054) ---------------------------------------------
+
+DEFAULT_USAGE_TZ = "Asia/Jakarta"
+DEFAULT_USAGE_DAYS = 30
+MAX_TRACKED_NIS = 50
+
+
+def parse_nis_values(raw: list[str] | str | None) -> list[str] | None:
+    if raw is None:
+        return None
+    items = [raw] if isinstance(raw, str) else list(raw)
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in items:
+        for part in entry.split(","):
+            v = part.strip()
+            if not v or len(v) > 30:
+                raise ValueError("each nis must be 1..30 non-whitespace characters")
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    if not out:
+        raise ValueError("nis must not be empty")
+    if len(out) > MAX_TRACKED_NIS:
+        raise ValueError(f"at most {MAX_TRACKED_NIS} nis values are allowed")
+    return out
+
+
+class AccountUsageQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nis: list[str] | None = None
+    tz: str = Field(default=DEFAULT_USAGE_TZ, min_length=1, max_length=64)
+    days: int = Field(default=DEFAULT_USAGE_DAYS, ge=1, le=365)
+
+    @field_validator("nis", mode="before")
+    @classmethod
+    def _validate_nis(cls, v) -> list[str] | None:
+        return parse_nis_values(v)
+
+    @field_validator("tz")
+    @classmethod
+    def _validate_tz(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("tz must not be blank")
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise ValueError("tz must be a valid IANA timezone") from None
+        return v
+
+
+class AccountUsageItemOut(BaseModel):
+    student_id: UUID
+    nis: str
+    full_name: str
+    active: bool
+    last_sign_in_at: datetime | None
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+class PeakHourBucketOut(BaseModel):
+    hour: int
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+class DailyActivityBucketOut(BaseModel):
+    date: date
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+class AccountUsageOut(BaseModel):
+    timezone: str
+    days: int
+    accounts: list[AccountUsageItemOut]
+    peak_hours: list[PeakHourBucketOut]
+    daily_activity: list[DailyActivityBucketOut]
+
+
+def _resolve_tracked_nis(query_nis: list[str] | None) -> list[str] | None:
+    if query_nis is not None:
+        return query_nis
+    env_raw = os.environ.get("TRACKED_STUDENT_NIS", "").strip()
+    if not env_raw:
+        return None
+    return parse_nis_values(env_raw)
+
+
+@router.get("/account-usage", response_model=AccountUsageOut)
+async def get_account_usage(
+    request: Request, q: Annotated[AccountUsageQuery, Query()]
+) -> AccountUsageOut:
+    nis_list = _resolve_tracked_nis(q.nis)
+    since = datetime.now(timezone.utc) - timedelta(days=q.days)
+    zone = ZoneInfo(q.tz)
+    async with request.app.state.open_db() as db:
+        report = await _repo(db).get_account_usage(
+            nis_list=nis_list, since=since, tz_name=q.tz
+        )
+    accounts = [
+        AccountUsageItemOut(
+            student_id=a.student_id,
+            nis=a.nis,
+            full_name=a.full_name,
+            active=a.active,
+            last_sign_in_at=(
+                a.last_sign_in_at.astimezone(zone)
+                if a.last_sign_in_at is not None
+                else None
+            ),
+            login_count=a.login_count,
+            token_refreshed_count=a.token_refreshed_count,
+            total_events=a.total_events,
+        )
+        for a in report.accounts
+    ]
+    return AccountUsageOut(
+        timezone=q.tz,
+        days=q.days,
+        accounts=accounts,
+        peak_hours=[PeakHourBucketOut(**vars(b)) for b in report.peak_hours],
+        daily_activity=[DailyActivityBucketOut(**vars(d)) for d in report.daily_activity],
     )

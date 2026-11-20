@@ -14,6 +14,7 @@ from app.db.admin import AdminRepository, PostgresAdminRepository
 from app.db.chat import ChatRepository, PostgresChatRepository
 from app.db.devices import DeviceLookup, PostgresDeviceLookup
 from app.db.kiosk import KioskRepository, PostgresKioskRepository
+from app.db.login_sessions import LoginSessionRepository, PostgresLoginSessionRepository
 from app.db.logs import MatchingLogWriter, PostgresMatchingLogWriter
 from app.db.phrases import PhraseRepository, PostgresPhraseLookup, connect
 from app.db.staff import PostgresStaffRepository, StaffRepository
@@ -30,6 +31,7 @@ class RequestDb:
     kiosk: KioskRepository | None = None  # kiosk operations (ADR-047 D7–D9)
     students: StudentRepository | None = None  # student login / profile (ADR-051 D2)
     chat: ChatRepository | None = None  # chatbot history (ADR-051 D4)
+    login_sessions: LoginSessionRepository | None = None  # demo/judge tracking (ADR-055)
 
 
 OpenDb = Callable[[], AbstractAsyncContextManager[RequestDb]]
@@ -51,6 +53,7 @@ async def open_postgres() -> AsyncIterator[RequestDb]:
             kiosk=PostgresKioskRepository(conn),
             students=PostgresStudentRepository(conn),
             chat=PostgresChatRepository(conn),
+            login_sessions=PostgresLoginSessionRepository(conn),
         )
     finally:
         await conn.close()

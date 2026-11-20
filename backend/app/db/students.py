@@ -14,7 +14,7 @@ from uuid import UUID
 from psycopg import AsyncConnection
 
 _COLS = (
-    "s.id, s.institution_id, i.name, s.nis, s.full_name, s.class_name, s.grade, s.avatar_url, s.active"
+    "s.id, s.institution_id, i.name, s.nis, s.full_name, s.class_name, s.grade, s.avatar_url, s.active, s.account_type"
 )
 _FROM = "from student_profiles s join institutions i on i.id = s.institution_id"
 
@@ -30,6 +30,7 @@ class StudentProfile:
     grade: int | None
     avatar_url: str | None
     active: bool
+    account_type: str | None = None
 
 
 @dataclass(frozen=True)

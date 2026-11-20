@@ -496,6 +496,7 @@ def test_exact_production_route_surface():
     # Student login/profile + chatbot (ADR-051); the only DELETE is a student's own chat session.
     assert all_paths == [
         ("DELETE", "/api/chat/sessions/{session_id}"),
+        ("GET", "/api/admin/account-usage"),  # ADR-054
         ("GET", "/api/admin/devices"),
         ("GET", "/api/admin/logs"),
         ("GET", "/api/admin/phrases"),
@@ -525,7 +526,9 @@ def test_exact_production_route_surface():
         ("POST", "/api/logs"),
         ("POST", "/api/match/sign"),
         ("POST", "/api/student/auth/login"),
+        ("POST", "/api/student/auth/logout"),  # ADR-055
         ("POST", "/api/student/auth/refresh"),
+        ("POST", "/api/student/session/heartbeat"),  # ADR-055
     ]
 
 

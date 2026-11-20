@@ -1,13 +1,21 @@
 """Phase 5B admin API: auth boundary, ADR-040 conventions, error mapping (fake repository)."""
 import json
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import UUID, uuid4
 
 import psycopg.errors
 import pytest
 
-from app.db.admin import AdminDevice, AdminLog, AdminPhrase
+from app.db.admin import (
+    AccountUsageItem,
+    AccountUsageReport,
+    AdminDevice,
+    AdminLog,
+    AdminPhrase,
+    DailyActivityBucket,
+    PeakHourBucket,
+)
 from tests.admin_support import FakeAdminDb, admin_auth, admin_client  # noqa: F401 (fixture)
 
 P1 = UUID("00000000-0000-0000-0000-0000000000p1".replace("p", "a"))
@@ -68,6 +76,41 @@ class FakeRepo:
         self.calls.append(("list_devices", limit, offset))
         return [AdminDevice(uuid4(), uuid4(), "Kiosk 1", True)], 1
 
+    async def get_account_usage(self, *, nis_list, since, tz_name):
+        self.calls.append(("get_account_usage", nis_list, since, tz_name))
+        sid_juri = UUID("00000000-0000-0000-0000-000000000101")
+        sid_coba = UUID("00000000-0000-0000-0000-000000000102")
+        accounts = [
+            AccountUsageItem(
+                student_id=sid_juri,
+                nis="1001",
+                full_name="Akun Juri",
+                active=True,
+                last_sign_in_at=NOW,
+                login_count=5,
+                token_refreshed_count=12,
+                total_events=17,
+            ),
+            AccountUsageItem(
+                student_id=sid_coba,
+                nis="1002",
+                full_name="Akun Coba",
+                active=True,
+                last_sign_in_at=None,
+                login_count=10,
+                token_refreshed_count=20,
+                total_events=30,
+            ),
+        ]
+        if nis_list is not None:
+            accounts = [a for a in accounts if a.nis in nis_list]
+        hours = [
+            PeakHourBucket(h, 15 if h == 19 else 0, 32 if h == 19 else 0, 47 if h == 19 else 0)
+            for h in range(24)
+        ]
+        days = [DailyActivityBucket(date(2026, 9, 29), 15, 32, 47)]
+        return AccountUsageReport(accounts=accounts, peak_hours=hours, daily_activity=days)
+
 
 @pytest.fixture
 def repo():
@@ -95,6 +138,7 @@ def err(r, status, code):
     ("patch", f"/api/admin/phrases/{P1}", {"active": False}),
     ("get", "/api/admin/logs", None),
     ("get", "/api/admin/devices", None),
+    ("get", "/api/admin/account-usage", None),
 ])
 def test_every_admin_endpoint_requires_admin(admin_auth, repo, method, path, body):
     db = FakeAdminDb(repo)
@@ -313,3 +357,61 @@ def test_devices_fields(api):
 def test_devices_read_only(api, method):
     c, h, _ = api
     assert getattr(c, method)("/api/admin/devices", headers=h).status_code == 405
+
+
+# ---- account usage (ADR-054) ------------------------------------------------------------------
+
+def test_account_usage_defaults_and_shape(api, repo, monkeypatch):
+    monkeypatch.delenv("TRACKED_STUDENT_NIS", raising=False)
+    c, h, _ = api
+    r = c.get("/api/admin/account-usage", headers=h)
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["timezone"] == "Asia/Jakarta"
+    assert b["days"] == 30
+    assert len(b["accounts"]) == 2
+    assert set(b["accounts"][0]) == {
+        "student_id", "nis", "full_name", "active", "last_sign_in_at",
+        "login_count", "token_refreshed_count", "total_events"
+    }
+    # 12:00 UTC converted to Asia/Jakarta (+07:00) → 19:00:00+07:00
+    assert b["accounts"][0]["last_sign_in_at"] == "2026-09-29T19:00:00+07:00"
+    assert b["accounts"][1]["last_sign_in_at"] is None
+    assert len(b["peak_hours"]) == 24
+    assert b["peak_hours"][19] == {"hour": 19, "login_count": 15, "token_refreshed_count": 32, "total_events": 47}
+    assert b["daily_activity"] == [{"date": "2026-09-29", "login_count": 15, "token_refreshed_count": 32, "total_events": 47}]
+    call_name, nis_list, since, tz_name = repo.calls[-1]
+    assert (call_name, nis_list, tz_name) == ("get_account_usage", None, "Asia/Jakarta")
+    assert since.tzinfo is not None
+
+
+def test_account_usage_query_nis_and_env_fallback(api, repo, monkeypatch):
+    c, h, _ = api
+    monkeypatch.setenv("TRACKED_STUDENT_NIS", "1001, 1002")
+    r_env = c.get("/api/admin/account-usage", headers=h)
+    assert r_env.status_code == 200
+    assert repo.calls[-1][1] == ["1001", "1002"]
+
+    r_q = c.get("/api/admin/account-usage?nis=1001&days=7&tz=UTC", headers=h)
+    assert r_q.status_code == 200
+    assert r_q.json()["timezone"] == "UTC" and r_q.json()["days"] == 7
+    assert [a["nis"] for a in r_q.json()["accounts"]] == ["1001"]
+    assert repo.calls[-1][1] == ["1001"]
+
+
+@pytest.mark.parametrize("qs", [
+    "days=0",
+    "days=-5",
+    "days=366",
+    "tz=Invalid/Zone",
+    "tz=",
+    "nis=",
+    "nis=,",
+    f"nis={'x' * 31}",
+    "unknown_param=1",
+])
+def test_account_usage_invalid_query_422(api, qs):
+    c, h, db = api
+    err(c.get(f"/api/admin/account-usage?{qs}", headers=h), 422, "VALIDATION_ERROR")
+    assert db.opened == 0
+

@@ -314,3 +314,75 @@ def test_reference_insert_hitting_partial_index_is_409_with_cleanup(admin_auth, 
     assert r.status_code == 409 and r.json()["error"]["code"] == "CONFLICT"
     assert [x.method for x in storage.requests] == ["POST", "DELETE"] and storage.objects == {}
     assert q(db_url, "select video_url from sign_references where phrase_id = %s", (pid,)) == [("winner",)]
+
+
+# ---- ADR-054 account usage tracking against real PostgreSQL -----------------------------------
+
+def test_account_usage_aggregation_pg(client, db_url):
+    import json
+    import psycopg
+
+    c, h = client
+    u_juri = uuid.uuid4()
+    u_coba = uuid.uuid4()
+    u_other = uuid.uuid4()
+    now_utc = datetime.now(timezone.utc).replace(minute=30, second=0, microsecond=0)
+    t_recent_1 = now_utc - timedelta(hours=2)
+    t_recent_2 = now_utc - timedelta(days=1)
+    t_old = now_utc - timedelta(days=45)
+
+    with psycopg.connect(db_url, autocommit=True) as conn:
+        for uid, email, last_in in (
+            (u_juri, f"juri-{u_juri.hex[:6]}@siswa.test", t_recent_1),
+            (u_coba, f"coba-{u_coba.hex[:6]}@siswa.test", None),
+            (u_other, f"other-{u_other.hex[:6]}@siswa.test", t_recent_2),
+        ):
+            conn.execute(
+                "insert into auth.users (id, email, last_sign_in_at) values (%s, %s, %s)",
+                (uid, email, last_in),
+            )
+        conn.execute(
+            "insert into student_profiles (id, institution_id, nis, full_name, active) values"
+            " (%s, %s, 'JURI01', 'Akun Juri', true),"
+            " (%s, %s, 'COBA01', 'Akun Coba', true),"
+            " (%s, %s, 'LAIN99', 'Akun Lain', false)",
+            (u_juri, INST, u_coba, INST, u_other, INST),
+        )
+        audit_rows = [
+            (uuid.uuid4(), json.dumps({"action": "login", "actor_id": str(u_juri)}), t_recent_1),
+            (uuid.uuid4(), json.dumps({"action": "token_refreshed", "actor_id": str(u_juri)}), t_recent_1),
+            (uuid.uuid4(), json.dumps({"action": "token_refreshed", "traits": {"user_id": str(u_juri)}}), t_recent_2),
+            (uuid.uuid4(), json.dumps({"action": "login", "actor_id": str(u_coba)}), t_recent_2),
+            (uuid.uuid4(), json.dumps({"action": "logout", "actor_id": str(u_juri)}), t_recent_1),  # ignored action
+            (uuid.uuid4(), json.dumps({"action": "login", "actor_id": str(u_juri)}), t_old),  # outside 30d window
+            (uuid.uuid4(), json.dumps({"action": "login", "actor_id": str(u_other)}), t_recent_1),  # filtered out by NIS
+        ]
+        for aid, payload, ts in audit_rows:
+            conn.execute(
+                "insert into auth.audit_log_entries (id, payload, created_at) values (%s, %s::json, %s)",
+                (aid, payload, ts),
+            )
+    try:
+        r = c.get("/api/admin/account-usage?nis=JURI01&nis=COBA01&days=30&tz=Asia/Jakarta", headers=h)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert [a["nis"] for a in data["accounts"]] == ["COBA01", "JURI01"]
+        by_nis = {a["nis"]: a for a in data["accounts"]}
+        assert by_nis["JURI01"]["login_count"] == 1
+        assert by_nis["JURI01"]["token_refreshed_count"] == 2
+        assert by_nis["JURI01"]["total_events"] == 3
+        assert by_nis["JURI01"]["last_sign_in_at"] is not None
+        assert by_nis["COBA01"]["login_count"] == 1
+        assert by_nis["COBA01"]["token_refreshed_count"] == 0
+        assert by_nis["COBA01"]["total_events"] == 1
+        assert by_nis["COBA01"]["last_sign_in_at"] is None
+        assert sum(b["total_events"] for b in data["peak_hours"]) == 4
+        assert sum(d["total_events"] for d in data["daily_activity"]) == 4
+    finally:
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            conn.execute(
+                "delete from auth.audit_log_entries where coalesce(payload->>'actor_id', payload->'traits'->>'user_id') = any(%s)",
+                ([str(u_juri), str(u_coba), str(u_other)],),
+            )
+            conn.execute("delete from auth.users where id = any(%s)", ([u_juri, u_coba, u_other],))
+

@@ -244,8 +244,10 @@ Token siswa ditolak oleh dependensi staf/admin dan sebaliknya.
 
 | Method | Path | Auth | Request | Response | Error |
 |---|---|---|---|---|---|
-| POST | `/api/student/auth/login` | publik | `{nis: str 1–30, password: str 1–1024}` | 200 `{access_token, token_type: "bearer", expires_in, refresh_token, student}` | 422, 401 INVALID_CREDENTIALS, 503 AUTH_UNAVAILABLE |
+| POST | `/api/student/auth/login` | publik | `{nis: str 1–30, password: str 1–1024, visitor_id?: UUID}` (+ header opsional `X-Visitor-Id` / cookie otomatis `lunar_visitor_id`) | 200 `{access_token, token_type: "bearer", expires_in, refresh_token, student}` | 422, 401 INVALID_CREDENTIALS, 503 AUTH_UNAVAILABLE |
 | POST | `/api/student/auth/refresh` | publik | `{refresh_token: str 1–4096}` | 200 sama dengan login | 422, 401 INVALID_CREDENTIALS, 503 AUTH_UNAVAILABLE |
+| POST | `/api/student/auth/logout` | siswa | | 204 (mencatat `logout_at` sesi Demo/Judge di `user_login_sessions`, best-effort; ADR-055) | 401, 403, 503 |
+| POST | `/api/student/session/heartbeat` | siswa | | 204 (memperbarui `last_activity_at` sesi Demo/Judge, best-effort; ADR-055) | 401, 403, 503 |
 | GET | `/api/student/me` | siswa | | 200 `student` | 401, 403, 503 |
 
 `student = {id, nis, full_name, class_name, grade, avatar_url, institution: {id, name}}`. Semua response di atas memakai `Cache-Control: no-store`. Setiap kegagalan kredensial memakai satu pesan generik.
@@ -294,6 +296,7 @@ Token siswa ditolak oleh dependensi staf/admin dan sebaliknya.
 | GET | `/api/admin/devices` | `page`, `page_size` | 200 `Page[{id, institution_id, label, active}]` | |
 | POST | `/api/admin/staff` | `{email, password ≥ 8, full_name, nip?, username?, role: "admin"\|"petugas", unit_kerja, job_title, shift_schedule?}` | 201 `Staff` (institusi dari profil pemanggil) | 409, 503 AUTH_UNAVAILABLE |
 | GET | `/api/admin/staff` | `page`, `page_size` | 200 `Page[Staff]` (institusi pemanggil saja) | |
+| GET | `/api/admin/account-usage` | `nis?` (bisa berulang / dipisah koma; fallback `TRACKED_STUDENT_NIS`, lalu semua siswa), `tz?` (default `"Asia/Jakarta"`), `days?` (`1..365`, default `30`) | 200 `{timezone, days, accounts: [{student_id, nis, full_name, active, last_sign_in_at, login_count, token_refreshed_count, total_events}], peak_hours: [{hour, login_count, token_refreshed_count, total_events}], daily_activity: [{date, login_count, token_refreshed_count, total_events}]}` | 422 VALIDATION_ERROR |
 
 `Phrase = {id, phrase_text, category, language_variant, active, model_phrase_id, sign_recognizable}`. `Staff = {id, institution_id, full_name, role, nip, username, unit_kerja, job_title, shift_schedule, active, created_at}`.
 
@@ -352,6 +355,7 @@ Sumber: `Database/migrations/*.sql` (urut waktu). Semua migration setelah fase 1
 | `20261006000000_adr049_seed_43_label_vocabulary.sql` | Seed label 32–42 |
 | `20261013000000_adr051_student_chat_schema.sql` | `student_profiles`, `chat_sessions`, `chat_messages` |
 | `20261014000000_adr053_chat_video_context_documents.sql` | `chat_messages.video_id`, `chat_messages.video_t_sec`, `chat_documents` |
+| `20261120000000_adr055_user_login_sessions.sql` | `student_profiles.account_type`, `user_login_sessions`, view `user_login_sessions_status` & `user_login_account_summary` |
 
 ```mermaid
 erDiagram

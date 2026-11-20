@@ -107,3 +107,73 @@ def test_chat_history_roundtrip_and_isolation(setup, admin_auth):
     assert c.patch(f"/api/chat/sessions/{s['id']}", headers=ha, json={"title": "IPA"}).json()["title"] == "IPA"
     assert c.delete(f"/api/chat/sessions/{s['id']}", headers=ha).status_code == 204
     assert c.get("/api/chat/sessions", headers=ha).json()["total"] == 0
+
+
+def test_login_sessions_tracking_and_views_pg(setup, admin_auth):
+    import psycopg
+
+    c, db, ids, _ = setup
+    with psycopg.connect(db["url"], autocommit=True) as conn:
+        conn.execute("update student_profiles set account_type = 'demo' where id = %s", (ids["a"],))
+        conn.execute("update student_profiles set account_type = 'judge' where id = %s", (ids["b"],))
+
+    # Demo logs in from two different visitors (Visitor 1 logs out, Visitor 2 stays active)
+    v1 = "11111111-1111-4111-8111-111111111111"
+    v2 = "22222222-2222-4222-8222-222222222222"
+    r_demo = c.post("/api/student/auth/login", json={"nis": db["nis"]["a"], "password": PASSWORD, "visitor_id": v1})
+    assert r_demo.status_code == 200
+    h_demo_v1 = {"Authorization": f"Bearer {r_demo.json()['access_token']}", "X-Visitor-Id": v1}
+    assert c.post("/api/student/session/heartbeat", headers=h_demo_v1).status_code == 204
+    assert c.post("/api/student/auth/logout", headers=h_demo_v1).status_code == 204
+
+    c.cookies.clear()
+    assert c.post(
+        "/api/student/auth/login",
+        json={"nis": db["nis"]["a"], "password": PASSWORD},
+        headers={"X-Visitor-Id": v2},
+    ).status_code == 200
+
+    # Judge logs in twice from the same visitor: first session inactive > 30 minutes (expired), second stays active
+    v_judge = "33333333-3333-4333-8333-333333333333"
+    assert c.post(
+        "/api/student/auth/login",
+        json={"nis": db["nis"]["b"], "password": PASSWORD, "visitor_id": v_judge},
+    ).status_code == 200
+    with psycopg.connect(db["url"], autocommit=True) as conn:
+        conn.execute(
+            "update user_login_sessions"
+            " set login_at = now() - interval '45 minutes', last_activity_at = now() - interval '35 minutes'"
+            " where user_id = %s",
+            (ids["b"],),
+        )
+    assert c.post(
+        "/api/student/auth/login",
+        json={"nis": db["nis"]["b"], "password": PASSWORD, "visitor_id": v_judge},
+    ).status_code == 200
+
+    with psycopg.connect(db["url"]) as conn:
+        statuses = conn.execute(
+            "select account_type, session_status from user_login_sessions_status order by account_type, login_at"
+        ).fetchall()
+        assert statuses == [
+            ("demo", "logged_out"),
+            ("demo", "active"),
+            ("judge", "expired"),
+            ("judge", "active"),
+        ]
+
+        summary = {
+            r[0]: r[1:]
+            for r in conn.execute(
+                "select account_type, ever_used, total_logins, unique_visitors, active_sessions"
+                " from user_login_account_summary"
+            ).fetchall()
+        }
+        assert summary["demo"] == (True, 2, 2, 1)
+        assert summary["judge"] == (True, 2, 1, 1)
+
+        visitors = conn.execute(
+            "select visitor_id::text, account_type, total_logins from user_login_visitor_summary order by visitor_id"
+        ).fetchall()
+        assert visitors == [(v1, "demo", 1), (v2, "demo", 1), (v_judge, "judge", 2)]
+

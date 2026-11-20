@@ -143,6 +143,7 @@ Folder `backend/`, `ml/`, dan `Database/` sengaja tetap bersebelahan: `pip insta
 | `app/provisioning/supabase_admin.py` | Supabase Auth Admin API (buat/hapus user staf/siswa) |
 | `scripts/apply_migrations.py` | Terapkan migration idempoten yang belum ada (status / `--apply`) |
 | `scripts/create_student.py` | Daftarkan siswa: institusi, user Auth (email sintetis), `student_profiles`, rollback bila gagal |
+| `scripts/track_usage.py` | Laporan aktivitas login, refresh token, terakhir login, & peak hours akun demo/siswa (ADR-054) |
 | `setup-dev.ps1`, `run-dev.ps1` | Setup venv + dependensi; jalankan uvicorn dengan `.env` dimuat |
 | `tests/` | Unit, API/contract, dan test Postgres opsional (`*_pg.py`) |
 
@@ -241,6 +242,8 @@ Hanya nama dan arti. Nilai nyata tidak pernah di-commit; `backend/.env.example` 
 | `OPENROUTER_SITE_URL` | tidak | Header `HTTP-Referer` atribusi |
 | `BACKEND_TEST_DATABASE_URL` | test saja | DB kosong sekali pakai untuk test `*_pg.py` |
 | `STUDENT_PASSWORD` | skrip saja | Password untuk `create_student.py` tanpa prompt |
+| `TRACKED_STUDENT_NIS` | tidak | Daftar NIS akun demo (mis. juri & coba), dipisah koma, untuk default `/api/admin/account-usage` dan `scripts/track_usage.py` (ADR-054) |
+| `DEMO_STUDENT_NIS`, `JUDGE_STUDENT_NIS` | tidak | Fallback daftar NIS (dipisah koma) untuk menandai akun `demo` / `judge` pada tabel `user_login_sessions` bila `student_profiles.account_type` kosong (ADR-055) |
 
 **Aplikasi siswa** (`Frontend`, build-time Vite; masuk ke bundle, jangan isi rahasia)
 

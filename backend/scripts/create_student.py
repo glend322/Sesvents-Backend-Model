@@ -30,6 +30,7 @@ import psycopg  # noqa: E402
 
 from app.errors import Conflict  # noqa: E402
 from app.provisioning.supabase_admin import SupabaseAdminClient, WeakPassword  # noqa: E402
+from scripts.apply_migrations import _load_env_file  # noqa: E402
 
 EMAIL_DOMAIN = "siswa.isyara.local"
 
@@ -41,10 +42,17 @@ def parse() -> argparse.Namespace:
     p.add_argument("--class", dest="class_name")
     p.add_argument("--grade", type=int, choices=range(1, 13), metavar="1-12")
     p.add_argument("--school", required=True, help="nama sekolah (institutions.name)")
+    p.add_argument(
+        "--account-type",
+        choices=["demo", "judge"],
+        default=None,
+        help="opsional: tandai akun khusus untuk login activity tracking ('demo' atau 'judge', ADR-055)",
+    )
     return p.parse_args()
 
 
 async def main() -> int:
+    _load_env_file()
     a = parse()
     nis = a.nis.strip()
     if not nis or len(nis) > 30:
@@ -83,11 +91,18 @@ async def main() -> int:
                 print("Password ditolak kebijakan password Supabase. Pakai password yang lebih kuat.", file=sys.stderr)
                 return 1
             try:
-                conn.execute(
-                    "insert into student_profiles (id, institution_id, nis, full_name, class_name, grade)"
-                    " values (%s, %s, %s, %s, %s, %s)",
-                    (user_id, school_id, nis, a.name.strip(), a.class_name, a.grade),
-                )
+                if a.account_type is not None:
+                    conn.execute(
+                        "insert into student_profiles (id, institution_id, nis, full_name, class_name, grade, account_type)"
+                        " values (%s, %s, %s, %s, %s, %s, %s)",
+                        (user_id, school_id, nis, a.name.strip(), a.class_name, a.grade, a.account_type),
+                    )
+                else:
+                    conn.execute(
+                        "insert into student_profiles (id, institution_id, nis, full_name, class_name, grade)"
+                        " values (%s, %s, %s, %s, %s, %s)",
+                        (user_id, school_id, nis, a.name.strip(), a.class_name, a.grade),
+                    )
             except Exception:
                 await admin.delete_user(user_id)  # rollback: jangan tinggalkan akun tanpa profil
                 raise
