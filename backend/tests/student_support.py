@@ -24,9 +24,10 @@ SISWA_2 = UUID("00000000-0000-0000-0000-0000000006a2")
 SISWA_INACTIVE = UUID("00000000-0000-0000-0000-0000000006a3")
 
 
-def student(sid: UUID, *, nis: str, full_name="Nadia Putri", active=True) -> StudentProfile:
+def student(sid: UUID, *, nis: str, full_name="Nadia Putri", active=True, account_type=None) -> StudentProfile:
     return StudentProfile(id=sid, institution_id=SCHOOL, institution_name="SLB Negeri Contoh", nis=nis,
-                          full_name=full_name, class_name="5A", grade=5, avatar_url=None, active=active)
+                          full_name=full_name, class_name="5A", grade=5, avatar_url=None, active=active,
+                          account_type=account_type)
 
 
 def default_students() -> dict[UUID, tuple[str | None, StudentProfile]]:
@@ -150,16 +151,128 @@ class FakeChatRepo:
         return ChatActivity(video_questions=q, documents=d)
 
 
+class FakeLoginSessionRepo:
+    """In-memory LoginSessionRepository (ADR-055)."""
+
+    def __init__(self) -> None:
+        self.sessions: list[dict] = []
+        self.calls: list[tuple] = []
+        self.fail: bool = False
+        self._now = datetime(2026, 11, 20, 5, 0, tzinfo=timezone.utc)
+
+    def advance(self, seconds: int) -> None:
+        self._now += timedelta(seconds=seconds)
+
+    def _find_active(
+        self,
+        user_id: UUID,
+        auth_session_id: str | None,
+        visitor_id: UUID | None,
+        inactivity_minutes: int,
+    ) -> dict | None:
+        cutoff = self._now - timedelta(minutes=inactivity_minutes)
+        if auth_session_id is not None:
+            for s in reversed(self.sessions):
+                if s["user_id"] == user_id and s["auth_session_id"] == auth_session_id and s["logout_at"] is None:
+                    return s
+        if visitor_id is not None:
+            for s in reversed(self.sessions):
+                if (
+                    s["user_id"] == user_id
+                    and s["visitor_id"] == visitor_id
+                    and s["logout_at"] is None
+                    and s["last_activity_at"] >= cutoff
+                ):
+                    return s
+        for s in reversed(self.sessions):
+            if s["user_id"] == user_id and s["logout_at"] is None and s["last_activity_at"] >= cutoff:
+                return s
+        return None
+
+    async def create_session(
+        self,
+        *,
+        user_id: UUID,
+        account_type: str,
+        auth_session_id: str | None = None,
+        visitor_id: UUID | None = None,
+    ) -> UUID:
+        self.calls.append(("create_session", user_id, account_type, auth_session_id, visitor_id))
+        if self.fail:
+            raise RuntimeError("tracking db down")
+        sid = uuid.uuid4()
+        self.sessions.append({
+            "session_id": sid,
+            "user_id": user_id,
+            "account_type": account_type,
+            "auth_session_id": auth_session_id,
+            "visitor_id": visitor_id,
+            "login_at": self._now,
+            "last_activity_at": self._now,
+            "logout_at": None,
+            "session_duration_seconds": 0,
+        })
+        return sid
+
+    async def touch_activity(
+        self,
+        *,
+        user_id: UUID,
+        auth_session_id: str | None = None,
+        visitor_id: UUID | None = None,
+        min_interval_seconds: int = 0,
+        inactivity_minutes: int = 30,
+    ) -> bool:
+        self.calls.append(("touch_activity", user_id, auth_session_id, visitor_id, min_interval_seconds))
+        if self.fail:
+            raise RuntimeError("tracking db down")
+        s = self._find_active(user_id, auth_session_id, visitor_id, inactivity_minutes)
+        if s is None:
+            return False
+        if min_interval_seconds > 0 and (self._now - s["last_activity_at"]).total_seconds() < min_interval_seconds:
+            return False
+        s["last_activity_at"] = self._now
+        s["session_duration_seconds"] = max(0, int((self._now - s["login_at"]).total_seconds()))
+        return True
+
+    async def end_session(
+        self,
+        *,
+        user_id: UUID,
+        auth_session_id: str | None = None,
+        visitor_id: UUID | None = None,
+        inactivity_minutes: int = 30,
+    ) -> bool:
+        self.calls.append(("end_session", user_id, auth_session_id, visitor_id))
+        if self.fail:
+            raise RuntimeError("tracking db down")
+        s = self._find_active(user_id, auth_session_id, visitor_id, inactivity_minutes)
+        if s is None:
+            return False
+        s["logout_at"] = self._now
+        s["last_activity_at"] = self._now
+        s["session_duration_seconds"] = max(0, int((self._now - s["login_at"]).total_seconds()))
+        return True
+
+
 class FakeStudentDb:
     def __init__(self) -> None:
         self.students = FakeStudentRepo()
         self.chat = FakeChatRepo()
+        self.login_sessions = FakeLoginSessionRepo()
         self.opened = 0
 
     @asynccontextmanager
     async def open(self):
         self.opened += 1
-        yield RequestDb(devices=None, phrases=None, logs=None, students=self.students, chat=self.chat)
+        yield RequestDb(
+            devices=None,
+            phrases=None,
+            logs=None,
+            students=self.students,
+            chat=self.chat,
+            login_sessions=self.login_sessions,
+        )
 
 
 class FakeChatModel:

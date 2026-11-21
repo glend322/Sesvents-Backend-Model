@@ -25,6 +25,14 @@ from starlette.concurrency import run_in_threadpool
 
 from app.auth.staff import subject_uuid
 from app.auth.student import StudentPrincipal, is_student, require_student
+from app.db.login_sessions import (
+    VISITOR_COOKIE_MAX_AGE_S,
+    VISITOR_COOKIE_NAME,
+    extract_visitor_id,
+    jwt_session_id,
+    resolve_account_type,
+    resolve_or_create_visitor_id,
+)
 from app.db.students import StudentProfile
 from app.errors import AuthUnavailable, InvalidCredentials, Unauthorized
 
@@ -40,6 +48,7 @@ class StudentLoginRequest(BaseModel):
 
     nis: StrictStr = Field(min_length=1, max_length=30)
     password: StrictStr = Field(min_length=1, max_length=1024)
+    visitor_id: UUID | None = None
 
     @field_validator("nis")
     @classmethod
@@ -112,6 +121,30 @@ async def student_login(payload: StudentLoginRequest, request: Request, response
     if not is_student(claims) or subject_uuid(claims) != target.profile.id:
         raise InvalidCredentials(_INVALID)
 
+    # ADR-055: record a new login session + anonymous Visitor ID for tracked Demo/Judge accounts.
+    account_type = resolve_account_type(target.profile)
+    if account_type is not None:
+        visitor_id = resolve_or_create_visitor_id(request, payload.visitor_id)
+        try:
+            async with request.app.state.open_db() as db:
+                if db.login_sessions is not None:
+                    await db.login_sessions.create_session(
+                        user_id=target.profile.id,
+                        account_type=account_type,
+                        auth_session_id=jwt_session_id(claims),
+                        visitor_id=visitor_id,
+                    )
+        except Exception:
+            pass
+        response.set_cookie(
+            key=VISITOR_COOKIE_NAME,
+            value=str(visitor_id),
+            max_age=VISITOR_COOKIE_MAX_AGE_S,
+            path="/",
+            httponly=True,
+            samesite="lax",
+        )
+
     response.headers.update(_NO_STORE)
     return StudentLoginResponse(
         access_token=grant.access_token,
@@ -149,8 +182,19 @@ async def student_refresh(payload: StudentRefreshRequest, request: Request, resp
         if db.students is None:
             raise RuntimeError("student repository missing")
         profile = await db.students.get_profile(user_id)
-    if profile is None or profile.active is not True:
-        raise InvalidCredentials(_INVALID)
+        if profile is None or profile.active is not True:
+            raise InvalidCredentials(_INVALID)
+        # ADR-055: token refresh counts as session activity for tracked Demo/Judge accounts (best-effort).
+        if db.login_sessions is not None and resolve_account_type(profile) is not None:
+            try:
+                await db.login_sessions.touch_activity(
+                    user_id=user_id,
+                    auth_session_id=jwt_session_id(claims),
+                    visitor_id=extract_visitor_id(request),
+                    min_interval_seconds=0,
+                )
+            except Exception:
+                pass
 
     response.headers.update(_NO_STORE)
     return StudentLoginResponse(
@@ -159,6 +203,49 @@ async def student_refresh(payload: StudentRefreshRequest, request: Request, resp
         refresh_token=grant.refresh_token,
         student=student_out(profile),
     )
+
+
+@router.post("/api/student/auth/logout", status_code=204, response_class=Response)
+async def student_logout(
+    request: Request, principal: StudentPrincipal = Depends(require_student)
+) -> Response:
+    """Record explicit logout for tracked Demo/Judge accounts (ADR-055).
+
+    Derives user_id and auth_session_id strictly from the verified student JWT (cannot be spoofed).
+    Best-effort: never blocks logout even if tracking storage fails.
+    """
+    if resolve_account_type(principal.profile) is not None:
+        try:
+            async with request.app.state.open_db() as db:
+                if db.login_sessions is not None:
+                    await db.login_sessions.end_session(
+                        user_id=principal.user_id,
+                        auth_session_id=principal.auth_session_id,
+                        visitor_id=principal.visitor_id,
+                    )
+        except Exception:
+            pass
+    return Response(status_code=204, headers=_NO_STORE)
+
+
+@router.post("/api/student/session/heartbeat", status_code=204, response_class=Response)
+async def student_session_heartbeat(
+    request: Request, principal: StudentPrincipal = Depends(require_student)
+) -> Response:
+    """Lightweight heartbeat to update LastActivityAt for tracked Demo/Judge sessions (ADR-055)."""
+    if resolve_account_type(principal.profile) is not None:
+        try:
+            async with request.app.state.open_db() as db:
+                if db.login_sessions is not None:
+                    await db.login_sessions.touch_activity(
+                        user_id=principal.user_id,
+                        auth_session_id=principal.auth_session_id,
+                        visitor_id=principal.visitor_id,
+                        min_interval_seconds=0,
+                    )
+        except Exception:
+            pass
+    return Response(status_code=204, headers=_NO_STORE)
 
 
 @router.get("/api/student/me", response_model=StudentOut)

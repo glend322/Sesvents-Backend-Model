@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 from uuid import UUID
@@ -74,6 +74,41 @@ class LogFilters:
     created_to: datetime | None = None  # inclusive
 
 
+@dataclass(frozen=True)
+class AccountUsageItem:
+    student_id: UUID
+    nis: str
+    full_name: str
+    active: bool
+    last_sign_in_at: datetime | None
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+@dataclass(frozen=True)
+class PeakHourBucket:
+    hour: int
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+@dataclass(frozen=True)
+class DailyActivityBucket:
+    date: date
+    login_count: int
+    token_refreshed_count: int
+    total_events: int
+
+
+@dataclass(frozen=True)
+class AccountUsageReport:
+    accounts: list[AccountUsageItem]
+    peak_hours: list[PeakHourBucket]
+    daily_activity: list[DailyActivityBucket]
+
+
 class AdminRepository(Protocol):
     async def list_phrases(self, *, limit: int, offset: int) -> tuple[list[AdminPhrase], int]: ...
     async def get_phrase(self, phrase_id: UUID) -> AdminPhrase | None: ...
@@ -84,6 +119,9 @@ class AdminRepository(Protocol):
     async def list_devices(self, *, limit: int, offset: int) -> tuple[list[AdminDevice], int]: ...
     async def has_approved_reference(self, phrase_id: UUID) -> bool: ...
     async def insert_approved_reference(self, *, reference_id: UUID, phrase_id: UUID, video_url: str) -> AdminReference: ...
+    async def get_account_usage(
+        self, *, nis_list: list[str] | None, since: datetime, tz_name: str
+    ) -> AccountUsageReport: ...
 
 
 class PostgresAdminRepository:
@@ -206,3 +244,144 @@ class PostgresAdminRepository:
             offset,
         )
         return [AdminDevice(*r) for r in rows], total
+
+    # ---- account usage (ADR-054) ------------------------------------------------------------
+    async def get_account_usage(
+        self, *, nis_list: list[str] | None, since: datetime, tz_name: str
+    ) -> AccountUsageReport:
+        async with self._conn.cursor() as cur:
+            if nis_list is not None:
+                await cur.execute(
+                    "select s.id, s.nis, s.full_name, s.active, u.last_sign_in_at"
+                    " from student_profiles s"
+                    " left join auth.users u on u.id = s.id"
+                    " where s.nis = any(%s)"
+                    " order by s.nis asc, s.id asc",
+                    (nis_list,),
+                )
+            else:
+                await cur.execute(
+                    "select s.id, s.nis, s.full_name, s.active, u.last_sign_in_at"
+                    " from student_profiles s"
+                    " left join auth.users u on u.id = s.id"
+                    " order by s.nis asc, s.id asc"
+                )
+            student_rows = await cur.fetchall()
+
+            if not student_rows:
+                return AccountUsageReport(
+                    accounts=[],
+                    peak_hours=[PeakHourBucket(h, 0, 0, 0) for h in range(24)],
+                    daily_activity=[],
+                )
+
+            id_strings = [str(r[0]) for r in student_rows]
+            await cur.execute(
+                "with matched as ("
+                "  select"
+                "    coalesce(a.payload->>'actor_id', a.payload->'traits'->>'user_id') as actor_id,"
+                "    a.payload->>'action' as action,"
+                "    a.created_at"
+                "  from auth.audit_log_entries a"
+                "  where a.created_at is not null"
+                "    and a.created_at >= %s"
+                "    and (a.payload->>'action') in ('login', 'token_refreshed')"
+                "    and coalesce(a.payload->>'actor_id', a.payload->'traits'->>'user_id') = any(%s)"
+                ")"
+                " select actor_id,"
+                "   count(*) filter (where action = 'login') as logins,"
+                "   count(*) filter (where action = 'token_refreshed') as refreshes"
+                " from matched"
+                " group by actor_id",
+                (since, id_strings),
+            )
+            counts_by_actor: dict[str, tuple[int, int]] = {
+                r[0]: (int(r[1]), int(r[2])) for r in await cur.fetchall()
+            }
+
+            await cur.execute(
+                "with matched as ("
+                "  select"
+                "    a.payload->>'action' as action,"
+                "    a.created_at at time zone %s as local_ts"
+                "  from auth.audit_log_entries a"
+                "  where a.created_at is not null"
+                "    and a.created_at >= %s"
+                "    and (a.payload->>'action') in ('login', 'token_refreshed')"
+                "    and coalesce(a.payload->>'actor_id', a.payload->'traits'->>'user_id') = any(%s)"
+                ")"
+                " select extract(hour from local_ts)::int as hr,"
+                "   count(*) filter (where action = 'login') as logins,"
+                "   count(*) filter (where action = 'token_refreshed') as refreshes"
+                " from matched"
+                " group by hr"
+                " order by hr asc",
+                (tz_name, since, id_strings),
+            )
+            hour_map: dict[int, tuple[int, int]] = {
+                int(r[0]): (int(r[1]), int(r[2])) for r in await cur.fetchall()
+            }
+
+            await cur.execute(
+                "with matched as ("
+                "  select"
+                "    a.payload->>'action' as action,"
+                "    (a.created_at at time zone %s)::date as local_date"
+                "  from auth.audit_log_entries a"
+                "  where a.created_at is not null"
+                "    and a.created_at >= %s"
+                "    and (a.payload->>'action') in ('login', 'token_refreshed')"
+                "    and coalesce(a.payload->>'actor_id', a.payload->'traits'->>'user_id') = any(%s)"
+                ")"
+                " select local_date,"
+                "   count(*) filter (where action = 'login') as logins,"
+                "   count(*) filter (where action = 'token_refreshed') as refreshes"
+                " from matched"
+                " group by local_date"
+                " order by local_date asc",
+                (tz_name, since, id_strings),
+            )
+            daily_rows = await cur.fetchall()
+
+        accounts: list[AccountUsageItem] = []
+        for sid, nis, full_name, active, last_sign_in_at in student_rows:
+            logins, refreshes = counts_by_actor.get(str(sid), (0, 0))
+            accounts.append(
+                AccountUsageItem(
+                    student_id=sid,
+                    nis=nis,
+                    full_name=full_name,
+                    active=bool(active),
+                    last_sign_in_at=last_sign_in_at,
+                    login_count=logins,
+                    token_refreshed_count=refreshes,
+                    total_events=logins + refreshes,
+                )
+            )
+
+        peak_hours: list[PeakHourBucket] = []
+        for h in range(24):
+            logins, refreshes = hour_map.get(h, (0, 0))
+            peak_hours.append(
+                PeakHourBucket(
+                    hour=h,
+                    login_count=logins,
+                    token_refreshed_count=refreshes,
+                    total_events=logins + refreshes,
+                )
+            )
+
+        daily_activity = [
+            DailyActivityBucket(
+                date=r[0],
+                login_count=int(r[1]),
+                token_refreshed_count=int(r[2]),
+                total_events=int(r[1]) + int(r[2]),
+            )
+            for r in daily_rows
+        ]
+        return AccountUsageReport(
+            accounts=accounts,
+            peak_hours=peak_hours,
+            daily_activity=daily_activity,
+        )

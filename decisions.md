@@ -2544,3 +2544,69 @@ Reviewers found the app unfocused: kiosk, a home page full of videos and a chatb
 2. OCR for photos of worksheets (needs a vision-capable model and a privacy decision).
 3. Retention policy for chat history and documents (ADR-051 open item 3 still open).
 4. Teacher role to send material to a class (ADR-051 open item 4).
+
+---
+
+# ADR-054 — Student Demo Account Usage Tracking (Supabase Auth & Audit Logs)
+
+**Status:** Accepted (requested and approved by the project owner, 2026-11-19)
+**Relates to:** ADR-012 (privacy), ADR-039 (admin JWT verification), ADR-040 (admin conventions), ADR-048 (stand-in `auth` tables for PostgreSQL tests), ADR-051 D2 (student accounts).
+
+## Context
+During judging and demos, two student accounts ("akun juri" and "akun coba") are provided so judges and visitors can try the application. The team needs visibility into how often those accounts are used, when each was last signed in, and the peak hours and daily distribution of sessions without introducing invasive tracking or new persistence tables.
+
+## Decisions
+1. **Read-only from existing Supabase tables.** Account usage is computed directly from `student_profiles`, `auth.users` (`last_sign_in_at`), and `auth.audit_log_entries` (`created_at`, `payload->>'action'` in `('login', 'token_refreshed')`, matched to the student UUID via `coalesce(payload->>'actor_id', payload->'traits'->>'user_id')`). No new database table or migration is required.
+2. **Account selection by NIS.** Target accounts are selected by `student_profiles.nis`:
+   * From the query parameter `nis` (repeatable or comma-separated, e.g. `?nis=1001&nis=1002` or `?nis=1001,1002`).
+   * If `nis` is omitted in the request, fallback to the optional environment variable `TRACKED_STUDENT_NIS` (comma-separated NIS values).
+   * If neither is provided, all rows in `student_profiles` (ordered by `nis ASC, id ASC`) are returned.
+3. **Admin API endpoint.** `GET /api/admin/account-usage` (guarded by `require_admin`, ADR-039):
+   * Query parameters (`extra="forbid"`):
+     * `nis`: optional list of NIS strings (each trimmed, non-empty, `1..30` chars, max 50 items).
+     * `tz`: optional IANA timezone name (default `"Asia/Jakarta"` / WIB, UTC+7), validated via Python standard library `zoneinfo.ZoneInfo` (invalid timezone → `422 VALIDATION_ERROR`).
+     * `days`: optional integer lookback window in days for `auth.audit_log_entries` (`1..365`, default `30`).
+   * Response shape (`200 OK`):
+     * `timezone`: the resolved IANA timezone string.
+     * `days`: the lookback window in days.
+     * `accounts`: list of `{student_id, nis, full_name, active, last_sign_in_at, login_count, token_refreshed_count, total_events}`.
+     * `peak_hours`: 24 entries (`hour` `0..23` in the requested timezone) each with `{hour, login_count, token_refreshed_count, total_events}` aggregated across the selected accounts within the lookback window.
+     * `daily_activity`: chronological list of active dates (`date` `YYYY-MM-DD` in the requested timezone) each with `{date, login_count, token_refreshed_count, total_events}` aggregated across the selected accounts within the lookback window.
+4. **Operator CLI script.** `backend/scripts/track_usage.py` queries the same repository logic using `DATABASE_URL` and prints a human-readable summary table (or `--json`) for operator/developer terminal use without needing an admin JWT.
+5. **Privacy (ADR-012).** No passwords, tokens, IP addresses, user agents, raw audit payloads, or landmark/chat data are exposed or stored.
+6. **Tests (extends ADR-048 §6).** Plain PostgreSQL test fixtures ensure `auth.users` includes `last_sign_in_at timestamptz` and provide a stand-in `auth.audit_log_entries` table when the test database does not have a full Supabase `auth` schema.
+
+---
+
+# ADR-055 — Dedicated Login Activity Tracking Table for Demo & Judge Accounts
+
+**Status:** Accepted (requested and approved by the project owner, 2026-11-20)
+**Relates to:** ADR-012 (privacy), ADR-048 (RLS model), ADR-051 D2 (student accounts), ADR-052 (refresh token), ADR-054 (Supabase audit log usage report, retained).
+
+## Context
+In addition to reading Supabase Auth audit logs (ADR-054), the project owner needs direct, queryable session-level tracking in Postgres specifically for two special account types — **Demo** (`demo`, akun coba) and **Judge** (`judge`, akun juri) — recording each login session (`login_at`, `logout_at`, `last_activity_at`, `session_duration_seconds`, and active/expired status) without affecting regular student accounts, existing authentication security, or UI.
+
+## Decisions
+1. **Account identification (backend/database only).**
+   * Additive nullable column `student_profiles.account_type text check (account_type in ('demo', 'judge'))`.
+   * Backend environment fallback: `DEMO_STUDENT_NIS` and `JUDGE_STUDENT_NIS` (comma-separated NIS values) if `student_profiles.account_type` is `NULL`.
+   * Regular student accounts (`account_type IS NULL` and not in env) are never recorded in `user_login_sessions`.
+2. **Dedicated table `user_login_sessions`.**
+   * Columns: `session_id` (UUID PK), `user_id` (FK `student_profiles(id)` `on delete cascade`), `account_type` (`'demo' | 'judge'`), `auth_session_id` (nullable `text`, extracted only from verified Supabase JWT `session_id` claim when present), `visitor_id` (nullable `uuid`, anonymous visitor identifier), `login_at`, `last_activity_at`, `logout_at` (nullable), `session_duration_seconds` (`integer >= 0`).
+   * Every successful login inserts a new row; previous sessions are never overwritten.
+   * RLS enabled without policies (ADR-048 model).
+3. **Anonymous Visitor Identification (`visitor_id`).**
+   * Multiple visitors sharing the same Demo or Judge account are distinguished by an anonymous UUID (`visitor_id`).
+   * **Zero-FE-change automatic mode:** On login for a tracked account, Backend reads `lunar_visitor_id` cookie (if present and a valid UUID) or generates a new UUID v4 and sets `Set-Cookie: lunar_visitor_id=<uuid>; Max-Age=31536000; Path=/; HttpOnly; SameSite=Lax`. Because production (Vercel rewrite `/api/*`) and dev (Vite proxy `/api`) are same-origin, the browser persists and sends this cookie automatically without requiring any Frontend code change.
+   * **Client `localStorage` mode (optional):** Backend also accepts `visitor_id` in `POST /api/student/auth/login` JSON body (`visitor_id?: UUID`) or in the `X-Visitor-Id` request header (allowed in CORS).
+   * Non-UUID strings in header/cookie are ignored and replaced with a fresh UUID; non-UUID in JSON body returns `422 VALIDATION_ERROR`.
+   * `visitor_id` is never used for authentication or authorization. No browser fingerprinting and no IP address storage.
+4. **Session lifecycle & inactivity timeout (30 minutes).**
+   * **Login:** `POST /api/student/auth/login` creates a new `user_login_sessions` row with `session_id` and `visitor_id` (best-effort; never breaks login). Response JSON contract is unchanged.
+   * **Background activity:** `require_student` (throttled to ≥ 60 s between writes) and `POST /api/student/auth/refresh` update `last_activity_at` and `session_duration_seconds` on the matching active session (matched by `(user_id, auth_session_id)`, then `(user_id, visitor_id)`, then latest active session for `user_id`).
+   * **Explicit heartbeat & logout:** `POST /api/student/session/heartbeat` (`require_student` → `204`) and `POST /api/student/auth/logout` (`require_student` → `204`) derive `user_id` strictly from the verified ES256 JWT.
+   * **Expired detection & views:** SQL views `user_login_sessions_status`, `user_login_account_summary` (includes `unique_visitors`), and `user_login_visitor_summary` (per-visitor login count, first/last login, active sessions, total duration) classify open sessions with `now() - last_activity_at > interval '30 minutes'` as `'expired'`.
+5. **Privacy & security (ADR-012).** No passwords, access tokens, refresh tokens, browser fingerprints, IP addresses, or raw client payloads are ever stored in `user_login_sessions`.
+
+## Migration
+`Database/migrations/20261120000000_adr055_user_login_sessions.sql` and `Database/migrations/20261120010000_adr055_visitor_id.sql` — additive and idempotent. Registered in `backend/scripts/apply_migrations.py`.
