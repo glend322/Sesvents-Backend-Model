@@ -40,7 +40,10 @@ CHECKS: dict[str, str] = {
     "20261013000000_adr051_student_chat_schema.sql": "select to_regclass('chat_messages') is not null",
     "20261014000000_adr053_chat_video_context_documents.sql": "select to_regclass('chat_documents') is not null",
     "20261120000000_adr055_user_login_sessions.sql": "select to_regclass('user_login_sessions') is not null",
-    "20261120010000_adr055_visitor_id.sql": "select to_regclass('user_login_visitor_summary') is not null",
+    "20261120010000_adr055_visitor_id.sql": (
+        "select exists (select 1 from information_schema.columns"
+        " where table_name = 'user_login_sessions' and column_name = 'login_at_wib')"
+    ),
 }
 
 
